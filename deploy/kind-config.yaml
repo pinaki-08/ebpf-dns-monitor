@@ -1,0 +1,10 @@
+# kind cluster for testing dnsmon.
+#
+# Note: every node is a container sharing the Docker VM's kernel, so TCX
+# (kernel >= 6.6) and the ring buffer (>= 5.8) depend on that single kernel.
+# Check it with:  docker run --rm alpine uname -r
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+  - role: worker

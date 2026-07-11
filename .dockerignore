@@ -1,0 +1,9 @@
+# Keep the build context small and force a clean eBPF regeneration in-image.
+.git
+.gitignore
+bin/
+dnsmon_bpfel.go
+dnsmon_bpfeb.go
+*.o
+README.md
+lima.yaml

@@ -1,0 +1,42 @@
+# Lima VM for developing/running dnsmon on macOS.
+#
+#   limactl start --name=dnsmon ./lima.yaml
+#   limactl shell dnsmon
+#   cd /Users/$USER/ebpf-dns-monitor && make run
+#
+# Ubuntu 24.04 ships kernel 6.8 (TCX available) with BTF enabled.
+
+images:
+  - location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-amd64.img"
+    arch: "x86_64"
+  - location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img"
+    arch: "aarch64"
+
+cpus: 2
+memory: "2GiB"
+disk: "20GiB"
+
+mounts:
+  - location: "~/ebpf-dns-monitor"
+    writable: true
+
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update
+      apt-get install -y \
+        clang llvm libbpf-dev linux-tools-generic \
+        build-essential git golang-go
+      # clang -target bpf needs asm/ on the default include path.
+      ln -sf "/usr/include/$(uname -m)-linux-gnu/asm" /usr/include/asm
+      # bpftool ships in linux-tools-<kernel>; symlink the generic one onto PATH.
+      ln -sf "$(ls /usr/lib/linux-tools/*/bpftool | head -n1)" /usr/local/bin/bpftool || true
+
+  - mode: user
+    script: |
+      #!/bin/bash
+      set -eux
+      go version

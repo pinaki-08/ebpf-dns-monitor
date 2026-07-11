@@ -1,0 +1,71 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: dnsmon
+  labels:
+    # Allow privileged pods even when Pod Security Admission is enforced.
+    pod-security.kubernetes.io/enforce: privileged
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: dnsmon
+  namespace: dnsmon
+  labels:
+    app: dnsmon
+spec:
+  selector:
+    matchLabels:
+      app: dnsmon
+  template:
+    metadata:
+      labels:
+        app: dnsmon
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "2112"
+        prometheus.io/path: "/metrics"
+    spec:
+      # Share the node's network namespace so we can attach TCX to its interface
+      # and observe DNS egressing the node.
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      tolerations:
+        - operator: Exists # run on every node, including control-plane
+      containers:
+        - name: dnsmon
+          image: dnsmon:dev
+          imagePullPolicy: IfNotPresent
+          # Auto-detects the default-route interface (eth0 in kind).
+          # Pin it explicitly with: ["-v", "-iface", "eth0"]
+          args: ["-v"]
+          ports:
+            - name: metrics
+              containerPort: 2112
+              protocol: TCP
+          securityContext:
+            # Simplest for testing. Least-privilege alternative:
+            #   capabilities: { add: ["BPF", "PERFMON", "NET_ADMIN", "SYS_RESOURCE"] }
+            privileged: true
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dnsmon-metrics
+  namespace: dnsmon
+  labels:
+    app: dnsmon
+spec:
+  clusterIP: None # headless; endpoints are the node IPs (hostNetwork)
+  selector:
+    app: dnsmon
+  ports:
+    - name: metrics
+      port: 2112
+      targetPort: 2112
