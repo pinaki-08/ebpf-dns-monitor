@@ -110,9 +110,16 @@ static __always_inline int handle(struct __sk_buff *skb)
 	if (bpf_skb_load_bytes(skb, dns_off, &dnsh, sizeof(dnsh)) < 0)
 		return TC_ACT_OK;
 
-	__u32 copy_len = skb->len - dns_off;
-	if (copy_len > MAX_DNS - 1)
-		copy_len = MAX_DNS - 1; // bound for the verifier: copy_len in [12, 511]
+	// Bound the copy length for the verifier. The mask must come FIRST (before
+	// any clamp) or clang folds it away, leaving the length register tainted
+	// and triggering "R4 min value is negative". MAX_DNS is a power of two, so
+	// this yields a provable range of [0, MAX_DNS-1]; for the common case
+	// (payload < 512 bytes) copy_len equals the real payload length.
+	__u32 copy_len = (skb->len - dns_off) & (MAX_DNS - 1);
+	// Exclude zero so bpf_skb_load_bytes gets a provable [1, MAX_DNS-1] length
+	// (the verifier rejects a possibly zero-sized read).
+	if (copy_len == 0)
+		return TC_ACT_OK;
 
 	struct dns_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
 	if (!e)
