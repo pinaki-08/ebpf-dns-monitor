@@ -1,28 +1,26 @@
 # dnsmon
 
-A passive **eBPF DNS monitor** — think "Cilium's DNS visibility, minus the proxy."
+A passive **eBPF DNS monitor** — full DNS visibility without a userspace proxy.
 
 It attaches passive `tc`/TCX programs to a network interface, copies DNS packets
 into a ring buffer, decodes them in Go userspace, and exposes Prometheus metrics.
 
-## Why this exists (the Cilium angle)
+## Why this exists
 
-Cilium's DNS-based network policy (`toFQDNs`) does **not** parse DNS in eBPF.
-From the [Cilium docs](https://docs.cilium.io/en/stable/security/dns/):
-
-> "By default, Cilium uses an **in-agent DNS proxy** for DNS policy enforcement."
-
-The split of responsibilities in Cilium is:
+Most DNS-aware network-policy systems do **not** parse DNS in eBPF. To enforce
+domain-based rules (e.g. "allow `api.github.com`") they redirect port-53 traffic
+to a **userspace DNS proxy** that decodes the query and response, learns the
+domain→IP mapping, updates policy, and forwards the packet:
 
 | Layer | Component | Job |
 | --- | --- | --- |
 | Interception | eBPF datapath (tc + tproxy) | Redirect port-53 traffic to the proxy |
-| DNS parsing / visibility / enforcement | **userspace DNS proxy** (in the agent) | Decode query + response, learn domain→IP, update policy, forward |
+| DNS parsing / visibility / enforcement | **userspace DNS proxy** | Decode query + response, learn domain→IP, update policy, forward |
 
-Cilium parses in a proxy because fully decoding DNS inside the eBPF verifier is
-hard (compression pointers, EDNS0, TCP reassembly, bounded loops) — and to
-*block* a lookup you have to sit inline anyway. The cost is that the proxy is in
-the data path (an extra hop + latency) and only runs when policy/visibility is on.
+That split exists because fully decoding DNS inside the eBPF verifier is hard
+(compression pointers, EDNS0, TCP reassembly, bounded loops) — and to *block* a
+lookup you have to sit inline anyway. The cost is that the proxy is in the data
+path (an extra hop + latency) and only runs when policy/visibility is on.
 
 **dnsmon takes the opposite trade-off.** It is observe-only, so it can be
 passive:
@@ -135,6 +133,27 @@ roadmap item. Tear down with `make kind-down`.
 | `dnsmon_parse_errors_total` | counter | — |
 | `dnsmon_queries_by_domain_total` | counter | `domain`, `qtype` (only with `-per-domain-metrics`) |
 
+## Scraping with Prometheus
+
+The DaemonSet pods carry `prometheus.io/scrape` annotations, so any Prometheus
+using pod service-discovery picks them up automatically. A ready-to-apply
+Prometheus (RBAC + scrape config + Deployment + Service) is included for the kind
+setup:
+
+```bash
+kubectl apply -f deploy/prometheus.yaml
+kubectl -n monitoring rollout status deploy/prometheus
+kubectl -n monitoring port-forward svc/prometheus 9090:9090
+# browse http://localhost:9090/graph?g0.expr=dnsmon_responses_total&g0.tab=0
+```
+
+Example — `dnsmon_responses_total` by `rcode`, scraped live from the kind cluster:
+
+![Prometheus graph of dnsmon_responses_total by rcode](examples/prometheus-snapshot.png)
+
+A raw text snapshot of the exposition format is also included at
+[examples/metrics-snapshot.txt](examples/metrics-snapshot.txt).
+
 ## Flags
 
 | Flag | Default | Description |
@@ -159,7 +178,7 @@ roadmap item. Tear down with `make kind-down`.
 - IPv6 + TCP DNS parsing.
 - Process attribution (PID/comm) via a `cgroup/connect` hook filling a
   socket-cookie→PID map.
-- Optional inline enforcement (allow/deny list) — moving toward `toFQDN`-style
+- Optional inline enforcement (allow/deny list) — moving toward domain/FQDN-based
   policy, which is where a proxy or an inline verdict becomes necessary.
 - Pod metadata enrichment for the Kubernetes DaemonSet (see "Run on a kind
   cluster" — the DaemonSet itself is already included).
@@ -176,6 +195,8 @@ internal/metrics/        Prometheus collectors
 Dockerfile               multi-stage build (compiles eBPF + static binary)
 deploy/kind-config.yaml  kind cluster definition
 deploy/daemonset.yaml    privileged, hostNetwork DaemonSet + metrics Service
+deploy/prometheus.yaml   in-cluster Prometheus (RBAC + scrape config + UI)
+examples/                captured /metrics text + Prometheus UI screenshot
 lima.yaml                Linux VM for macOS (bare-host workflow)
 Makefile                 deps / generate / build / run / docker / kind
 ```

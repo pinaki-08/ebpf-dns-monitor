@@ -1,9 +1,9 @@
 // Command dnsmon is a passive, eBPF-based DNS monitor.
 //
-// Unlike Cilium's DNS-based policy path (which redirects port-53 traffic to a
-// userspace proxy for parsing and enforcement), dnsmon attaches passive tc/TCX
-// programs that copy DNS packets into a ring buffer. The kernel side never
-// proxies or blocks; all name decompression happens here in userspace.
+// Unlike DNS-policy systems that redirect port-53 traffic to a userspace proxy
+// for parsing and enforcement, dnsmon attaches passive tc/TCX programs that copy
+// DNS packets into a ring buffer. The kernel side never proxies or blocks; all
+// name decompression happens here in userspace.
 package main
 
 import (

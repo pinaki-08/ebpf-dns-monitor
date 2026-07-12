@@ -3,13 +3,13 @@
 // Passive DNS monitor attached at the tc (TCX) egress + ingress hooks.
 //
 // Design note (the whole point of this project):
-//   Cilium parses DNS in a *userspace proxy* because fully decoding DNS names
-//   (compression pointers, EDNS0, TCP reassembly) inside the eBPF verifier is
-//   painful. Here we do the opposite trade-off: the kernel program only
-//   validates that a packet is DNS-over-UDP and copies the raw DNS message into
-//   a ring buffer. All name decompression happens in Go userspace, where loops
-//   and pointers are free. We never redirect or proxy the packet, so we add
-//   almost no latency and are not in the enforcement data path.
+//   DNS-policy systems typically parse DNS in a *userspace proxy* because fully
+//   decoding DNS names (compression pointers, EDNS0, TCP reassembly) inside the
+//   eBPF verifier is painful. Here we take the opposite trade-off: the kernel
+//   program only validates that a packet is DNS-over-UDP and copies the raw DNS
+//   message into a ring buffer. All name decompression happens in Go userspace,
+//   where loops and pointers are free. We never redirect or proxy the packet, so
+//   we add almost no latency and are not in the enforcement data path.
 
 #include <linux/bpf.h>
 #include <bpf/bpf_helpers.h>

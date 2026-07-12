@@ -1,0 +1,34 @@
+# dnsmon /metrics snapshot — captured 2026-07-12T05:58:27Z from a kind cluster (Linux 6.12, TCX)
+# source: http://localhost:2112/metrics (dnsmon DaemonSet, iface eth0)
+#
+# HELP dnsmon_events_total Raw DNS events received from the kernel ring buffer.
+# TYPE dnsmon_events_total counter
+dnsmon_events_total 20
+# HELP dnsmon_parse_errors_total Events that could not be decoded.
+# TYPE dnsmon_parse_errors_total counter
+dnsmon_parse_errors_total 0
+# HELP dnsmon_queries_total DNS queries observed, by query type.
+# TYPE dnsmon_queries_total counter
+dnsmon_queries_total{qtype="A"} 5
+dnsmon_queries_total{qtype="AAAA"} 5
+# HELP dnsmon_query_duration_seconds Latency between a DNS query and its matching response.
+# TYPE dnsmon_query_duration_seconds histogram
+dnsmon_query_duration_seconds_bucket{le="0.0005"} 0
+dnsmon_query_duration_seconds_bucket{le="0.001"} 0
+dnsmon_query_duration_seconds_bucket{le="0.002"} 0
+dnsmon_query_duration_seconds_bucket{le="0.004"} 0
+dnsmon_query_duration_seconds_bucket{le="0.008"} 0
+dnsmon_query_duration_seconds_bucket{le="0.016"} 4
+dnsmon_query_duration_seconds_bucket{le="0.032"} 9
+dnsmon_query_duration_seconds_bucket{le="0.064"} 10
+dnsmon_query_duration_seconds_bucket{le="0.128"} 10
+dnsmon_query_duration_seconds_bucket{le="0.256"} 10
+dnsmon_query_duration_seconds_bucket{le="0.512"} 10
+dnsmon_query_duration_seconds_bucket{le="1.024"} 10
+dnsmon_query_duration_seconds_bucket{le="+Inf"} 10
+dnsmon_query_duration_seconds_sum 0.20211466599999997
+dnsmon_query_duration_seconds_count 10
+# HELP dnsmon_responses_total DNS responses observed, by response code.
+# TYPE dnsmon_responses_total counter
+dnsmon_responses_total{rcode="NOERROR"} 8
+dnsmon_responses_total{rcode="NXDOMAIN"} 2

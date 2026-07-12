@@ -14,7 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /src
 COPY . .
 
-# CGO off -> fully static binary (cilium/ebpf is pure Go, no libbpf at runtime).
+# CGO off -> fully static binary (the eBPF library is pure Go, no libbpf at runtime).
 # -mod=mod lets the build resolve modules even if go.sum wasn't committed yet.
 ENV CGO_ENABLED=0 GOFLAGS=-mod=mod
 RUN go mod download
