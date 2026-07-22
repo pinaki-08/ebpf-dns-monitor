@@ -26,8 +26,9 @@ spec:
         prometheus.io/port: "2112"
         prometheus.io/path: "/metrics"
     spec:
-      # Share the node's network namespace so we can attach TCX to its interface
-      # and observe DNS egressing the node.
+      # hostNetwork puts the metrics endpoint on the node IP (the headless
+      # Service below resolves to node IPs). The cgroup/skb attach itself does
+      # not need it -- it hooks the node's root cgroup, mounted into the pod.
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
       tolerations:
@@ -36,8 +37,8 @@ spec:
         - name: dnsmon
           image: dnsmon:dev
           imagePullPolicy: IfNotPresent
-          # Auto-detects the default-route interface (eth0 in kind).
-          # Pin it explicitly with: ["-v", "-iface", "eth0"]
+          # Attaches cgroup/skb at the node's root cgroup
+          # (default -cgroup=/sys/fs/cgroup, mounted from the host below).
           args: ["-v"]
           ports:
             - name: metrics
@@ -47,12 +48,23 @@ spec:
             # Simplest for testing. Least-privilege alternative:
             #   capabilities: { add: ["BPF", "PERFMON", "NET_ADMIN", "SYS_RESOURCE"] }
             privileged: true
+          volumeMounts:
+            # The node's real cgroup v2 root; attaching here covers every pod and
+            # host process on the node. Read-only is enough to attach a program.
+            - name: cgroup
+              mountPath: /sys/fs/cgroup
+              readOnly: true
           resources:
             requests:
               cpu: 25m
               memory: 32Mi
             limits:
               memory: 128Mi
+      volumes:
+        - name: cgroup
+          hostPath:
+            path: /sys/fs/cgroup
+            type: Directory
 ---
 apiVersion: v1
 kind: Service

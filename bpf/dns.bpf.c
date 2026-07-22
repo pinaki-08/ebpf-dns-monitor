@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 //
-// Passive DNS monitor attached at the tc (TCX) egress + ingress hooks.
+// Passive DNS monitor attached at the cgroup/skb egress + ingress hooks.
 //
 // Design note (the whole point of this project):
 //   DNS-policy systems typically parse DNS in a *userspace proxy* because fully
@@ -10,17 +10,26 @@
 //   message into a ring buffer. All name decompression happens in Go userspace,
 //   where loops and pointers are free. We never redirect or proxy the packet, so
 //   we add almost no latency and are not in the enforcement data path.
+//
+//   The hook is cgroup/skb (not tc), so a single program attached to the root
+//   cgroup observes DNS for every process on the node regardless of interface:
+//   pod->CoreDNS on the CNI veths, node-local lookups on lo, and egress to
+//   external resolvers. Because it runs at the socket layer, skb->data starts at
+//   the IP header -- there is no Ethernet header to skip.
 
 #include <linux/bpf.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
-#define ETH_HLEN 14
-#define ETH_P_IP 0x0800
 #define IPPROTO_UDP 17
 #define DNS_PORT 53
 #define MAX_DNS 512
-#define TC_ACT_OK 0
+// cgroup/skb runs at L3, so skb->data starts at the IP header (no Ethernet).
+#define IP_OFF 0
+// cgroup/skb verdict: 1 lets the packet pass, 0 DROPS it. We are observe-only,
+// so every return path must be CG_ALLOW -- returning 0 anywhere would black-hole
+// that DNS packet for the whole node.
+#define CG_ALLOW 1
 
 char LICENSE[] SEC("license") = "GPL";
 
@@ -55,60 +64,55 @@ struct {
 
 static __always_inline int handle(struct __sk_buff *skb)
 {
-	__u16 h_proto;
-	// EtherType lives at offset 12 in the Ethernet header.
-	if (bpf_skb_load_bytes(skb, 12, &h_proto, sizeof(h_proto)) < 0)
-		return TC_ACT_OK;
-	if (h_proto != bpf_htons(ETH_P_IP))
-		return TC_ACT_OK;
-
-	// IPv4: first byte holds version(4) + IHL(4). IHL is in 32-bit words.
+	// cgroup/skb starts at the IP header. First byte is version(4) + IHL(4).
 	__u8 verihl;
-	if (bpf_skb_load_bytes(skb, ETH_HLEN, &verihl, 1) < 0)
-		return TC_ACT_OK;
+	if (bpf_skb_load_bytes(skb, IP_OFF, &verihl, 1) < 0)
+		return CG_ALLOW;
+	if ((verihl >> 4) != 4)
+		return CG_ALLOW; // IPv4 only for now; IPv6 is a roadmap item
 	__u8 ihl = (verihl & 0x0F) * 4;
 	if (ihl < 20)
-		return TC_ACT_OK;
+		return CG_ALLOW;
 
 	__u8 proto;
-	if (bpf_skb_load_bytes(skb, ETH_HLEN + 9, &proto, 1) < 0)
-		return TC_ACT_OK;
+	if (bpf_skb_load_bytes(skb, IP_OFF + 9, &proto, 1) < 0)
+		return CG_ALLOW;
 	if (proto != IPPROTO_UDP)
-		return TC_ACT_OK; // v1 handles UDP only; TCP DNS is a roadmap item
+		return CG_ALLOW; // UDP only; TCP DNS is a roadmap item
 
 	// Skip fragmented datagrams (MF bit or non-zero fragment offset).
 	__u16 frag;
-	if (bpf_skb_load_bytes(skb, ETH_HLEN + 6, &frag, sizeof(frag)) < 0)
-		return TC_ACT_OK;
+	if (bpf_skb_load_bytes(skb, IP_OFF + 6, &frag, sizeof(frag)) < 0)
+		return CG_ALLOW;
 	if (frag & bpf_htons(0x2000 | 0x1FFF))
-		return TC_ACT_OK;
+		return CG_ALLOW;
 
 	__u8 saddr[4], daddr[4];
-	if (bpf_skb_load_bytes(skb, ETH_HLEN + 12, saddr, 4) < 0)
-		return TC_ACT_OK;
-	if (bpf_skb_load_bytes(skb, ETH_HLEN + 16, daddr, 4) < 0)
-		return TC_ACT_OK;
+	if (bpf_skb_load_bytes(skb, IP_OFF + 12, saddr, 4) < 0)
+		return CG_ALLOW;
+	if (bpf_skb_load_bytes(skb, IP_OFF + 16, daddr, 4) < 0)
+		return CG_ALLOW;
 
-	__u32 l4 = ETH_HLEN + ihl;
+	__u32 l4 = IP_OFF + ihl;
 
 	__be16 sport_n, dport_n;
 	if (bpf_skb_load_bytes(skb, l4, &sport_n, sizeof(sport_n)) < 0)
-		return TC_ACT_OK;
+		return CG_ALLOW;
 	if (bpf_skb_load_bytes(skb, l4 + 2, &dport_n, sizeof(dport_n)) < 0)
-		return TC_ACT_OK;
+		return CG_ALLOW;
 	if (sport_n != bpf_htons(DNS_PORT) && dport_n != bpf_htons(DNS_PORT))
-		return TC_ACT_OK;
+		return CG_ALLOW;
 
 	__u32 dns_off = l4 + 8; // UDP header is 8 bytes
 	// Need at least a full 12-byte DNS header; guards against len underflow.
 	if (skb->len < dns_off + 12)
-		return TC_ACT_OK;
+		return CG_ALLOW;
 
 	struct {
 		__be16 id, flags, qd, an, ns, ar;
 	} dnsh;
 	if (bpf_skb_load_bytes(skb, dns_off, &dnsh, sizeof(dnsh)) < 0)
-		return TC_ACT_OK;
+		return CG_ALLOW;
 
 	// Bound the copy length for the verifier. The mask must come FIRST (before
 	// any clamp) or clang folds it away, leaving the length register tainted
@@ -119,11 +123,11 @@ static __always_inline int handle(struct __sk_buff *skb)
 	// Exclude zero so bpf_skb_load_bytes gets a provable [1, MAX_DNS-1] length
 	// (the verifier rejects a possibly zero-sized read).
 	if (copy_len == 0)
-		return TC_ACT_OK;
+		return CG_ALLOW;
 
 	struct dns_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
 	if (!e)
-		return TC_ACT_OK;
+		return CG_ALLOW;
 
 	e->timestamp_ns = bpf_ktime_get_ns();
 	__builtin_memcpy(e->saddr, saddr, 4);
@@ -142,15 +146,25 @@ static __always_inline int handle(struct __sk_buff *skb)
 	__builtin_memset(e->payload, 0, sizeof(e->payload));
 	if (bpf_skb_load_bytes(skb, dns_off, e->payload, copy_len) < 0) {
 		bpf_ringbuf_discard(e, 0);
-		return TC_ACT_OK;
+		return CG_ALLOW;
 	}
 
 	bpf_ringbuf_submit(e, 0);
-	return TC_ACT_OK;
+	return CG_ALLOW;
 }
 
-SEC("tc")
-int dns_monitor(struct __sk_buff *skb)
+// One program per direction, both calling the same handler. Egress catches
+// queries leaving a process (and node-local responses from CoreDNS); ingress
+// catches responses arriving from off-node resolvers. Userspace de-dups the
+// node-local packets that legitimately appear on both hooks.
+SEC("cgroup_skb/egress")
+int dns_egress(struct __sk_buff *skb)
+{
+	return handle(skb);
+}
+
+SEC("cgroup_skb/ingress")
+int dns_ingress(struct __sk_buff *skb)
 {
 	return handle(skb);
 }

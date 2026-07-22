@@ -4,7 +4,8 @@
 #   limactl shell dnsmon
 #   cd /Users/$USER/ebpf-dns-monitor && make run
 #
-# Ubuntu 24.04 ships kernel 6.8 (TCX available) with BTF enabled.
+# Ubuntu 24.04 ships kernel 6.8 -- cgroup v2 unified, ring buffer, and cgroup/skb
+# bpf_link attach all available.
 
 images:
   - location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-amd64.img"

@@ -3,7 +3,7 @@
 # Run these targets *inside the Linux VM* (see lima.yaml). eBPF needs a Linux
 # kernel; nothing here builds on macOS directly.
 
-IFACE ?= $(shell ip route 2>/dev/null | awk '/default/ {print $$5; exit}')
+CGROUP ?= /sys/fs/cgroup
 METRICS_ADDR ?= :2112
 
 .PHONY: deps generate build run clean
@@ -23,9 +23,9 @@ build: generate
 	mkdir -p bin
 	go build -o bin/dnsmon .
 
-# Requires root (loading BPF + attaching to tc).
+# Requires root (loading BPF + attaching to the cgroup).
 run: build
-	sudo ./bin/dnsmon -iface $(IFACE) -metrics-addr $(METRICS_ADDR) -v
+	sudo ./bin/dnsmon -cgroup $(CGROUP) -metrics-addr $(METRICS_ADDR) -v
 
 clean:
 	rm -rf bin

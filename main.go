@@ -1,23 +1,22 @@
 // Command dnsmon is a passive, eBPF-based DNS monitor.
 //
 // Unlike DNS-policy systems that redirect port-53 traffic to a userspace proxy
-// for parsing and enforcement, dnsmon attaches passive tc/TCX programs that copy
-// DNS packets into a ring buffer. The kernel side never proxies or blocks; all
-// name decompression happens here in userspace.
+// for parsing and enforcement, dnsmon attaches passive cgroup/skb programs at
+// the root cgroup that copy DNS packets into a ring buffer. The kernel side
+// never proxies or blocks; all name decompression happens here in userspace.
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/binary"
 	"errors"
 	"flag"
+	"hash/fnv"
 	"log"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -34,23 +33,11 @@ import (
 )
 
 func main() {
-	iface := flag.String("iface", "", "network interface to attach to (default: auto-detect)")
+	cgroupPath := flag.String("cgroup", "/sys/fs/cgroup", "root cgroup v2 path to attach the cgroup/skb programs to")
 	metricsAddr := flag.String("metrics-addr", ":2112", "listen address for the Prometheus /metrics endpoint")
 	verbose := flag.Bool("v", false, "log every DNS event to stderr")
 	perDomain := flag.Bool("per-domain-metrics", false, "emit per-domain query counters (WARNING: high cardinality)")
 	flag.Parse()
-
-	ifaceName := *iface
-	if ifaceName == "" {
-		ifaceName = defaultIface()
-	}
-	if ifaceName == "" {
-		log.Fatal("could not auto-detect an interface; pass -iface")
-	}
-	nic, err := net.InterfaceByName(ifaceName)
-	if err != nil {
-		log.Fatalf("interface %q: %v", ifaceName, err)
-	}
 
 	if err := rlimit.RemoveMemlock(); err != nil {
 		log.Fatalf("remove memlock rlimit: %v", err)
@@ -62,24 +49,27 @@ func main() {
 	}
 	defer objs.Close()
 
-	// TCX requires a Linux kernel >= 6.6.
-	egress, err := link.AttachTCX(link.TCXOptions{
-		Interface: nic.Index,
-		Program:   objs.DnsMonitor,
-		Attach:    ebpf.AttachTCXEgress,
+	// Attach at the root cgroup so one program sees DNS for every process on the
+	// node, on any interface: pod->CoreDNS on the CNI veths, node-local lookups
+	// on lo, and egress to external resolvers. cgroup/skb needs a Linux kernel
+	// >= 5.7 for bpf_link-based attach.
+	egress, err := link.AttachCgroup(link.CgroupOptions{
+		Path:    *cgroupPath,
+		Attach:  ebpf.AttachCGroupInetEgress,
+		Program: objs.DnsEgress,
 	})
 	if err != nil {
-		log.Fatalf("attach tc egress (needs kernel >= 6.6): %v", err)
+		log.Fatalf("attach cgroup egress at %s: %v", *cgroupPath, err)
 	}
 	defer egress.Close()
 
-	ingress, err := link.AttachTCX(link.TCXOptions{
-		Interface: nic.Index,
-		Program:   objs.DnsMonitor,
-		Attach:    ebpf.AttachTCXIngress,
+	ingress, err := link.AttachCgroup(link.CgroupOptions{
+		Path:    *cgroupPath,
+		Attach:  ebpf.AttachCGroupInetIngress,
+		Program: objs.DnsIngress,
 	})
 	if err != nil {
-		log.Fatalf("attach tc ingress (needs kernel >= 6.6): %v", err)
+		log.Fatalf("attach cgroup ingress at %s: %v", *cgroupPath, err)
 	}
 	defer ingress.Close()
 
@@ -105,6 +95,9 @@ func main() {
 	trk := newTracker()
 	go trk.reap()
 
+	dd := newDedup()
+	go dd.reap()
+
 	stopper := make(chan os.Signal, 1)
 	signal.Notify(stopper, os.Interrupt, syscall.SIGTERM)
 	go func() {
@@ -114,7 +107,7 @@ func main() {
 		_ = srv.Close()
 	}()
 
-	log.Printf("monitoring DNS on %s (ifindex %d)", ifaceName, nic.Index)
+	log.Printf("monitoring DNS via cgroup/skb at %s", *cgroupPath)
 	for {
 		rec, err := rd.Read()
 		if err != nil {
@@ -130,11 +123,11 @@ func main() {
 			m.ParseErrors.Inc()
 			continue
 		}
-		handleEvent(&ev, m, trk, *verbose)
+		handleEvent(&ev, m, trk, dd, *verbose)
 	}
 }
 
-func handleEvent(ev *dnsmonDnsEvent, m *appmetrics.Metrics, trk *tracker, verbose bool) {
+func handleEvent(ev *dnsmonDnsEvent, m *appmetrics.Metrics, trk *tracker, dd *dedup, verbose bool) {
 	m.Events.Inc()
 
 	plen := int(ev.PayloadLen)
@@ -143,6 +136,15 @@ func handleEvent(ev *dnsmonDnsEvent, m *appmetrics.Metrics, trk *tracker, verbos
 	}
 	if plen < 12 {
 		m.ParseErrors.Inc()
+		return
+	}
+
+	// cgroup/skb fires on both the sender's egress and the receiver's ingress,
+	// so node-local DNS (pod<->CoreDNS) arrives twice. The DNS payload is
+	// byte-identical on both copies (NAT rewrites L3 addresses, not the DNS
+	// message), so collapse duplicates seen within a short window before we
+	// touch any counters.
+	if dd.duplicate(ev.IsResponse, ev.Payload[:plen]) {
 		return
 	}
 
@@ -256,23 +258,50 @@ func (t *tracker) reap() {
 	}
 }
 
-// defaultIface returns the interface backing the default IPv4 route.
-func defaultIface() string {
-	f, err := os.Open("/proc/net/route")
-	if err != nil {
-		return ""
-	}
-	defer f.Close()
+// --- de-duplication of the egress/ingress double-observation ---------------
+//
+// A node-local DNS datagram (e.g. pod<->CoreDNS on the same node) is seen once
+// as the sender's cgroup egress and once as the receiver's cgroup ingress. Both
+// copies carry an identical DNS payload, so we hash (is_response, payload) and
+// drop a repeat seen within dedupTTL.
 
-	sc := bufio.NewScanner(f)
-	if !sc.Scan() { // header
-		return ""
+const dedupTTL = 2 * time.Second
+
+type dedup struct {
+	mu sync.Mutex
+	m  map[uint64]time.Time
+}
+
+func newDedup() *dedup { return &dedup{m: make(map[uint64]time.Time)} }
+
+func (d *dedup) duplicate(isResponse uint8, payload []byte) bool {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte{isResponse})
+	_, _ = h.Write(payload)
+	key := h.Sum64()
+
+	now := time.Now()
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if t, ok := d.m[key]; ok && now.Sub(t) < dedupTTL {
+		return true
 	}
-	for sc.Scan() {
-		fields := strings.Fields(sc.Text())
-		if len(fields) >= 2 && fields[1] == "00000000" { // destination 0.0.0.0
-			return fields[0]
+	d.m[key] = now
+	return false
+}
+
+// reap keeps the dedup map from growing without bound.
+func (d *dedup) reap() {
+	tick := time.NewTicker(15 * time.Second)
+	defer tick.Stop()
+	for range tick.C {
+		cutoff := time.Now().Add(-dedupTTL)
+		d.mu.Lock()
+		for k, t := range d.m {
+			if t.Before(cutoff) {
+				delete(d.m, k)
+			}
 		}
+		d.mu.Unlock()
 	}
-	return ""
 }
